@@ -152,6 +152,8 @@ impl GlutinWindowContext {
 enum AppUserEvent {
     Tray(TrayEvent),
     Redraw(std::time::Duration),
+    PickedAddFolder(PathBuf),
+    PickedFolderGroup(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -280,9 +282,15 @@ impl App {
     }
 
     fn choose_folder_group(&mut self) {
-        let Some(root) = rfd::FileDialog::new().pick_folder() else {
-            return;
-        };
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = pick_folder("Select a folder group") {
+                let _ = proxy.send_event(AppUserEvent::PickedFolderGroup(path));
+            }
+        });
+    }
+
+    fn finish_choose_folder_group(&mut self, root: PathBuf) {
         match std::fs::read_dir(&root) {
             Ok(entries) => {
                 let mut folders: Vec<_> = entries
@@ -478,15 +486,12 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.heading("Folders");
                     if ui.button("Add folder").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.config.mappings.push(SyncMapping {
-                                id: Uuid::new_v4(),
-                                local_path: path,
-                                remote_path: String::new(),
-                                enabled: true,
-                                ignore_patterns: String::new(),
-                            });
-                        }
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            if let Some(path) = pick_folder("Select a folder to sync") {
+                                let _ = proxy.send_event(AppUserEvent::PickedAddFolder(path));
+                            }
+                        });
                     }
                     if ui.button("Add some folders...").clicked() {
                         self.choose_folder_group();
@@ -715,6 +720,24 @@ impl winit::application::ApplicationHandler<AppUserEvent> for App {
                     self.gl_window.as_ref().unwrap().window.request_redraw();
                 }
             }
+            AppUserEvent::PickedAddFolder(path) => {
+                self.config.mappings.push(SyncMapping {
+                    id: Uuid::new_v4(),
+                    local_path: path,
+                    remote_path: String::new(),
+                    enabled: true,
+                    ignore_patterns: String::new(),
+                });
+                if let Some(gl_window) = self.gl_window.as_ref() {
+                    gl_window.window.request_redraw();
+                }
+            }
+            AppUserEvent::PickedFolderGroup(root) => {
+                self.finish_choose_folder_group(root);
+                if let Some(gl_window) = self.gl_window.as_ref() {
+                    gl_window.window.request_redraw();
+                }
+            }
         }
     }
 
@@ -891,22 +914,34 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn pick_folder(title: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("zenity")
+        .args(["--file-selection", "--directory", "--title", title])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 // ── Main ──
 
 fn main() -> anyhow::Result<()> {
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let runtime = tokio::runtime::Runtime::new()?;
     std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(sync::run(commands_rx, events_tx));
+        runtime.block_on(sync::run(commands_rx, events_tx));
     });
 
     let event_loop = EventLoop::<AppUserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     let tray = create_tray(proxy.clone())?;
-    let app = App::new(commands_tx, events_rx, proxy, tray);
-    event_loop.run_app(&mut std::convert::identity(app))?;
+    let mut app = App::new(commands_tx, events_rx, proxy, tray);
+    event_loop.run_app(&mut app)?;
     Ok(())
 }

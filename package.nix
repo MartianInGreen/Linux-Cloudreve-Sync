@@ -3,8 +3,10 @@
 , pkg-config
 , clang
 , cmake
+, makeWrapper
 , libxkbcommon
 , libGL
+, zenity
 }:
 
 rustPlatform.buildRustPackage {
@@ -18,16 +20,22 @@ rustPlatform.buildRustPackage {
     pkg-config
     clang
     cmake
+    makeWrapper
   ];
 
   buildInputs = [
     libxkbcommon
     libGL
+    zenity
   ];
 
   postInstall = ''
     install -Dm644 assets/cloudreve-sync.desktop $out/share/applications/cloudreve-sync.desktop
     install -Dm644 logo-sync.png $out/share/pixmaps/cloudreve-sync.png
+  '';
+
+  postFixup = ''
+    wrapProgram $out/bin/cloudreve-sync --prefix PATH : ${lib.makeBinPath [ zenity ]}
   '';
 
   meta = {
