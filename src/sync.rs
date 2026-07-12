@@ -193,14 +193,30 @@ async fn sync_mapping(
             remote_changed,
         ) {
             (Some(_), None, None, _, _) => upload(dav, mapping, &path, events).await?,
-            (None, Some(entry), None, _, _) => download(dav, mapping, &path, entry, events).await?,
+            (None, Some(entry), None, _, _) => {
+                let local_hash = download(dav, mapping, &path, entry, events).await?;
+                previous.insert(
+                    path,
+                    EntryState {
+                        local_hash: Some(local_hash),
+                        remote_tag,
+                    },
+                );
+            }
             (None, Some(entry), Some(_), true, false) => {
                 delete_remote(dav, mapping, &entry.relative_path, events).await?
             }
             (Some(_), None, Some(_), false, true) => delete_local(mapping, &path, events).await?,
             (Some(_), Some(_), _, true, false) => upload(dav, mapping, &path, events).await?,
             (Some(_), Some(entry), _, false, true) => {
-                download(dav, mapping, &path, entry, events).await?
+                let local_hash = download(dav, mapping, &path, entry, events).await?;
+                previous.insert(
+                    path,
+                    EntryState {
+                        local_hash: Some(local_hash),
+                        remote_tag,
+                    },
+                );
             }
             (local, remote, _, true, true) => {
                 if let (Some(local_hash), Some(remote_entry)) = (local, remote) {
@@ -325,7 +341,7 @@ async fn download(
     relative: &str,
     entry: &RemoteEntry,
     events: &mpsc::UnboundedSender<BackendEvent>,
-) -> Result<()> {
+) -> Result<String> {
     let mut transfer = Transfer {
         direction: TransferDirection::Download,
         relative_path: relative.into(),
@@ -342,16 +358,17 @@ async fn download(
             .await?;
         let temp = target.with_extension("cloudreve-download");
         let bytes = data.len() as u64;
+        let hash = hash_bytes(&data);
         tokio::fs::write(&temp, data).await?;
         tokio::fs::rename(temp, target).await?;
-        Ok::<u64, anyhow::Error>(bytes)
+        Ok::<(u64, String), anyhow::Error>((bytes, hash))
     }
     .await;
-    if let Ok(bytes) = &result {
+    if let Ok((bytes, _)) = &result {
         transfer.bytes = Some(*bytes);
     }
     let _ = events.send(BackendEvent::TransferFinished(transfer, result.is_ok()));
-    result.map(|_| ())
+    result.map(|(_, hash)| hash)
 }
 
 async fn delete_remote(

@@ -39,9 +39,16 @@ impl WebDavClient {
     }
 
     fn url(&self, path: &str) -> Result<Url> {
-        self.base
-            .join(path.trim_start_matches('/'))
-            .context("invalid remote path")
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("WebDAV URL cannot contain remote paths"))?
+            .pop_if_empty()
+            .extend(
+                path.trim_matches('/')
+                    .split('/')
+                    .filter(|part| !part.is_empty()),
+            );
+        Ok(url)
     }
 
     fn request(&self, method: Method, path: &str) -> Result<reqwest::RequestBuilder> {
@@ -181,8 +188,14 @@ fn parse_multistatus(body: &[u8], base: &Url) -> Result<Vec<(String, RemoteEntry
                     tag = None;
                     is_dir = false;
                 }
-                b"href" => href = Some(reader.read_text(e.name())?.into_owned()),
-                b"getetag" => tag = Some(reader.read_text(e.name())?.into_owned()),
+                b"href" => {
+                    let text = reader.read_text(e.name())?;
+                    href = Some(quick_xml::escape::unescape(&text)?.into_owned());
+                }
+                b"getetag" => {
+                    let text = reader.read_text(e.name())?;
+                    tag = Some(quick_xml::escape::unescape(&text)?.into_owned());
+                }
                 b"collection" => is_dir = true,
                 _ => {}
             },
@@ -233,6 +246,44 @@ mod tests {
         assert_eq!(
             normalize_remote_path("/documents/work/"),
             normalize_remote_path("documents/work")
+        );
+    }
+
+    #[test]
+    fn request_url_encodes_filename_delimiters_as_path_characters() {
+        let client = WebDavClient::new("https://example.com/dav/Home", "user", "password").unwrap();
+
+        let url = client.url("Documents/Media/Your #1 question?.pdf").unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/dav/Home/Documents/Media/Your%20%231%20question%3F.pdf"
+        );
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+    }
+
+    #[test]
+    fn multistatus_unescapes_xml_entities_in_remote_paths() {
+        let base = Url::parse("https://example.com/dav/Home/").unwrap();
+        let body = br#"<?xml version="1.0"?>
+            <d:multistatus xmlns:d="DAV:">
+                <d:response>
+                    <d:href>/dav/Home/Pictures/NASA%E2%80%99s_SLS_&amp;_Falcon_9.jpg</d:href>
+                    <d:propstat><d:prop><d:getetag>&quot;picture-tag&quot;</d:getetag></d:prop></d:propstat>
+                </d:response>
+                <d:response>
+                    <d:href>/dav/Home/Documents/Data%20Engineering%20&amp;%20Science%20by%20O'Reilly.md</d:href>
+                </d:response>
+            </d:multistatus>"#;
+
+        let entries = parse_multistatus(body, &base).unwrap();
+
+        assert_eq!(entries[0].0, "Pictures/NASA’s_SLS_&_Falcon_9.jpg");
+        assert_eq!(entries[0].1.tag, "\"picture-tag\"");
+        assert_eq!(
+            entries[1].0,
+            "Documents/Data Engineering & Science by O'Reilly.md"
         );
     }
 }
