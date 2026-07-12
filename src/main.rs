@@ -5,91 +5,165 @@ mod storage;
 mod sync;
 mod webdav;
 
-use eframe::egui;
+use egui_winit::winit;
+use egui_winit::winit::raw_window_handle::HasWindowHandle;
 use model::{
     AppConfig, BackendCommand, BackendEvent, Conflict, ConflictChoice, SyncMapping, Transfer,
     TransferDirection,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::ops::{Deref, DerefMut};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::{Icon, WindowAttributes, WindowId};
 
-fn main() -> anyhow::Result<()> {
-    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-    let (events_tx, events_rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(sync::run(commands_rx, events_tx));
-    });
-    let (tray, tray_events) = create_tray()?;
-    let tray_events = Arc::new(Mutex::new(tray_events));
-    let mut state = Some(SyncState::new(commands_tx.clone(), events_rx));
-    loop {
-        let (state_tx, state_rx) = std_mpsc::channel();
-        let app_state = state.take().expect("application state must be available");
-        let options = native_options();
-        let app_tray_events = tray_events.clone();
-        eframe::run_native(
-            "Cloudreve Sync",
-            options,
-            Box::new(move |cc| {
-                cc.egui_ctx.set_visuals(egui::Visuals::dark());
-                Ok(Box::new(SyncApp {
-                    state: Some(app_state),
-                    state_tx,
-                    tray_events: app_tray_events,
-                    quitting: false,
-                }))
-            }),
-        )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let (returned_state, quitting) = state_rx
-            .recv()
-            .expect("window must return application state");
-        state = Some(returned_state);
-        if quitting {
-            let _ = commands_tx.send(BackendCommand::Shutdown);
-            drop(tray);
-            return Ok(());
-        }
-        loop {
-            match tray_events.lock().unwrap().recv() {
-                Ok(TrayEvent::Show) => break,
-                Ok(TrayEvent::Sync) => {
-                    let _ = commands_tx.send(BackendCommand::SyncNow);
-                }
-                Ok(TrayEvent::Quit) | Err(_) => {
-                    let _ = commands_tx.send(BackendCommand::Shutdown);
-                    drop(tray);
-                    return Ok(());
-                }
-            }
-        }
-    }
+// ── Glutin GL window context (adapted from egui_glow pure_glow example) ──
+
+struct GlutinWindowContext {
+    window: winit::window::Window,
+    gl_context: glutin::context::PossiblyCurrentContext,
+    gl_display: glutin::display::Display,
+    gl_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
 }
 
-fn native_options() -> eframe::NativeOptions {
-    let (rgba, width, height) = app_icon();
-    eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+impl GlutinWindowContext {
+    #[allow(unsafe_code)]
+    unsafe fn new(event_loop: &ActiveEventLoop) -> Self {
+        use glutin::context::NotCurrentGlContext;
+        use glutin::display::GetGlDisplay;
+        use glutin::display::GlDisplay;
+        use glutin::prelude::GlSurface;
+
+        let (icon_rgba, icon_w, icon_h) = app_icon();
+        let window_attrs = WindowAttributes::default()
             .with_title("Cloudreve Sync")
-            .with_app_id("cloudreve-sync")
-            .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([560.0, 420.0])
-            .with_icon(Arc::new(egui::IconData {
-                rgba,
-                width,
-                height,
-            })),
-        ..Default::default()
+            .with_inner_size(winit::dpi::LogicalSize {
+                width: 720.0,
+                height: 560.0,
+            })
+            .with_min_inner_size(winit::dpi::LogicalSize {
+                width: 560.0,
+                height: 420.0,
+            })
+            .with_window_icon(Icon::from_rgba(icon_rgba, icon_w, icon_h).ok())
+            .with_visible(false);
+
+        let config_template = glutin::config::ConfigTemplateBuilder::new()
+            .prefer_hardware_accelerated(None)
+            .with_depth_size(0)
+            .with_stencil_size(0)
+            .with_transparency(false);
+
+        let (mut window, gl_config) = glutin_winit::DisplayBuilder::new()
+            .with_preference(glutin_winit::ApiPreference::FallbackEgl)
+            .with_window_attributes(Some(window_attrs.clone()))
+            .build(event_loop, config_template, |mut iter| {
+                iter.next().expect("no matching GL config")
+            })
+            .expect("failed to create GL config");
+        let gl_display = gl_config.display();
+
+        let raw_handle = window.as_ref().map(|w| {
+            w.window_handle()
+                .expect("failed to get window handle")
+                .as_raw()
+        });
+        let context_attrs = glutin::context::ContextAttributesBuilder::new().build(raw_handle);
+        let fallback_attrs = glutin::context::ContextAttributesBuilder::new()
+            .with_context_api(glutin::context::ContextApi::Gles(None))
+            .build(raw_handle);
+
+        let not_current = unsafe {
+            gl_display
+                .create_context(&gl_config, &context_attrs)
+                .unwrap_or_else(|_| {
+                    gl_display
+                        .create_context(&gl_config, &fallback_attrs)
+                        .expect("failed to create GL context")
+                })
+        };
+
+        let window = window.take().unwrap_or_else(|| {
+            glutin_winit::finalize_window(event_loop, window_attrs, &gl_config)
+                .expect("failed to finalize window")
+        });
+
+        let (w, h): (u32, u32) = window.inner_size().into();
+        let w = NonZeroU32::new(w).unwrap_or(NonZeroU32::MIN);
+        let h = NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN);
+        let surface_attrs =
+            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
+                .build(
+                    window
+                        .window_handle()
+                        .expect("failed to get window handle")
+                        .as_raw(),
+                    w,
+                    h,
+                );
+        let gl_surface = unsafe {
+            gl_display
+                .create_window_surface(&gl_config, &surface_attrs)
+                .unwrap()
+        };
+        let gl_context = not_current.make_current(&gl_surface).unwrap();
+        gl_surface
+            .set_swap_interval(
+                &gl_context,
+                glutin::surface::SwapInterval::Wait(NonZeroU32::MIN),
+            )
+            .unwrap();
+
+        Self {
+            window,
+            gl_context,
+            gl_display,
+            gl_surface,
+        }
+    }
+
+    fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
+        use glutin::surface::GlSurface;
+        self.gl_surface.resize(
+            &self.gl_context,
+            size.width.try_into().unwrap(),
+            size.height.try_into().unwrap(),
+        );
+    }
+
+    fn swap_buffers(&self) {
+        use glutin::surface::GlSurface;
+        let _ = self.gl_surface.swap_buffers(&self.gl_context);
+    }
+
+    fn get_proc_address(&self, addr: &std::ffi::CStr) -> *const std::ffi::c_void {
+        use glutin::display::GlDisplay;
+        self.gl_display.get_proc_address(addr)
     }
 }
 
-struct SyncState {
+// ── User events ──
+
+#[derive(Debug)]
+enum AppUserEvent {
+    Tray(TrayEvent),
+    Redraw(std::time::Duration),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrayEvent {
+    Show,
+    Sync,
+    Quit,
+}
+
+// ── App ──
+
+struct App {
     config: AppConfig,
     commands: mpsc::UnboundedSender<BackendCommand>,
     events: mpsc::UnboundedReceiver<BackendEvent>,
@@ -102,28 +176,15 @@ struct SyncState {
     uploads: usize,
     downloads: usize,
     transferred_bytes: u64,
-    folder_selection: Option<FolderSelection>,
-}
-
-struct SyncApp {
-    state: Option<SyncState>,
-    state_tx: std_mpsc::Sender<(SyncState, bool)>,
-    tray_events: Arc<Mutex<std_mpsc::Receiver<TrayEvent>>>,
     quitting: bool,
-}
-
-impl Deref for SyncApp {
-    type Target = SyncState;
-
-    fn deref(&self) -> &Self::Target {
-        self.state.as_ref().unwrap()
-    }
-}
-
-impl DerefMut for SyncApp {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.state.as_mut().unwrap()
-    }
+    folder_selection: Option<FolderSelection>,
+    proxy: EventLoopProxy<AppUserEvent>,
+    _tray: ksni::blocking::Handle<CloudreveTray>,
+    // Window state — None when hidden to tray
+    gl_window: Option<GlutinWindowContext>,
+    gl: Option<Arc<glow::Context>>,
+    egui_glow: Option<egui_glow::EguiGlow>,
+    repaint_delay: std::time::Duration,
 }
 
 struct FolderSelection {
@@ -132,10 +193,12 @@ struct FolderSelection {
     folders: Vec<(PathBuf, bool)>,
 }
 
-impl SyncState {
+impl App {
     fn new(
         commands: mpsc::UnboundedSender<BackendCommand>,
         events: mpsc::UnboundedReceiver<BackendEvent>,
+        proxy: EventLoopProxy<AppUserEvent>,
+        tray: ksni::blocking::Handle<CloudreveTray>,
     ) -> Self {
         Self {
             config: storage::load_config(),
@@ -150,8 +213,53 @@ impl SyncState {
             uploads: 0,
             downloads: 0,
             transferred_bytes: 0,
+            quitting: false,
             folder_selection: None,
+            proxy,
+            _tray: tray,
+            gl_window: None,
+            gl: None,
+            egui_glow: None,
+            repaint_delay: std::time::Duration::MAX,
         }
+    }
+
+    fn create_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gl_window.is_some() {
+            return;
+        }
+        let gl_window = unsafe { GlutinWindowContext::new(event_loop) };
+        let gl = unsafe {
+            Arc::new(glow::Context::from_loader_function(|s| {
+                let s = std::ffi::CString::new(s).expect("CString for gl proc");
+                gl_window.get_proc_address(&s)
+            }))
+        };
+        let egui_glow = egui_glow::EguiGlow::new(event_loop, gl.clone(), None, None, true);
+        egui_glow.egui_ctx.set_visuals(egui::Visuals::dark());
+
+        let proxy = egui::mutex::Mutex::new(self.proxy.clone());
+        egui_glow
+            .egui_ctx
+            .set_request_repaint_callback(move |info| {
+                let _ = proxy.lock().send_event(AppUserEvent::Redraw(info.delay));
+            });
+
+        gl_window.window.set_visible(true);
+        gl_window.window.request_redraw();
+
+        self.gl_window = Some(gl_window);
+        self.gl = Some(gl);
+        self.egui_glow = Some(egui_glow);
+    }
+
+    fn destroy_window(&mut self) {
+        if let Some(mut eg) = self.egui_glow.take() {
+            eg.destroy();
+        }
+        self.gl = None;
+        self.gl_window = None;
+        self.repaint_delay = std::time::Duration::MAX;
     }
 
     fn save_settings(&mut self) {
@@ -227,150 +335,8 @@ impl SyncState {
         self.activity.push_front(message);
         self.activity.truncate(12);
     }
-}
 
-#[derive(Clone, Copy)]
-enum TrayEvent {
-    Show,
-    Sync,
-    Quit,
-}
-
-struct CloudreveTray {
-    events: std_mpsc::Sender<TrayEvent>,
-    icon: Vec<ksni::Icon>,
-}
-
-impl ksni::Tray for CloudreveTray {
-    fn id(&self) -> String {
-        "cloudreve-sync".into()
-    }
-
-    fn title(&self) -> String {
-        "Cloudreve Sync".into()
-    }
-
-    fn icon_name(&self) -> String {
-        String::new()
-    }
-
-    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        self.icon.clone()
-    }
-
-    fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.events.send(TrayEvent::Show);
-    }
-
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::StandardItem;
-        vec![
-            StandardItem {
-                label: "Show Cloudreve Sync".into(),
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.events.send(TrayEvent::Show);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Sync now".into(),
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.events.send(TrayEvent::Sync);
-                }),
-                ..Default::default()
-            }
-            .into(),
-            StandardItem {
-                label: "Quit".into(),
-                activate: Box::new(|tray: &mut Self| {
-                    let _ = tray.events.send(TrayEvent::Quit);
-                }),
-                ..Default::default()
-            }
-            .into(),
-        ]
-    }
-}
-
-fn create_tray() -> anyhow::Result<(
-    ksni::blocking::Handle<CloudreveTray>,
-    std_mpsc::Receiver<TrayEvent>,
-)> {
-    let image = image::load_from_memory(include_bytes!("../logo-sync.png"))?.into_rgba8();
-    let image = image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3);
-    let (width, height) = image.dimensions();
-    let rgba = image.into_raw();
-    let argb = rgba
-        .chunks_exact(4)
-        .flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]])
-        .collect();
-    let (events, receiver) = std_mpsc::channel();
-    let tray = ksni::blocking::TrayMethods::spawn(CloudreveTray {
-        events,
-        icon: vec![ksni::Icon {
-            width: width as i32,
-            height: height as i32,
-            data: argb,
-        }],
-    })?;
-    Ok((tray, receiver))
-}
-
-fn app_icon() -> (Vec<u8>, u32, u32) {
-    let image = image::load_from_memory(include_bytes!("../logo-sync.png"))
-        .expect("embedded application logo must be a valid PNG")
-        .into_rgba8();
-    let (width, height) = image.dimensions();
-    (image.into_raw(), width, height)
-}
-
-fn direction_label(direction: TransferDirection) -> &'static str {
-    match direction {
-        TransferDirection::Upload => "Uploading",
-        TransferDirection::Download => "Downloading",
-        TransferDirection::DeleteLocal => "Deleting locally",
-        TransferDirection::DeleteRemote => "Deleting remotely",
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-impl eframe::App for SyncApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        loop {
-            let event = self.tray_events.lock().unwrap().try_recv();
-            let Ok(event) = event else { break };
-            match event {
-                TrayEvent::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TrayEvent::Sync => {
-                    self.save_settings();
-                    let _ = self.commands.send(BackendCommand::SyncNow);
-                }
-                TrayEvent::Quit => {
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            }
-        }
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
-            self.record_activity("Closed window to the system tray".into());
-        }
+    fn poll_backend_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 BackendEvent::Status(status) => self.status = status,
@@ -425,9 +391,10 @@ impl eframe::App for SyncApp {
                 }
             }
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+    fn render_ui(&mut self, egui_ctx: &egui::Context) {
+        egui::TopBottomPanel::top("header").show(egui_ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Cloudreve Sync");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -435,7 +402,7 @@ impl eframe::App for SyncApp {
                 });
             });
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(egui_ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
@@ -628,7 +595,7 @@ impl eframe::App for SyncApp {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
-                .show(ctx, |ui| {
+                .show(egui_ctx, |ui| {
                     ui.label("Top folder");
                     ui.monospace(selection.root.display().to_string());
                     ui.add_space(8.0);
@@ -678,9 +645,268 @@ impl eframe::App for SyncApp {
         }
     }
 
-    fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
-        let _ = self
-            .state_tx
-            .send((self.state.take().unwrap(), self.quitting));
+    fn redraw(&mut self) {
+        let gl_window = match self.gl_window.take() {
+            Some(w) => w,
+            None => return,
+        };
+        let mut egui_glow = match self.egui_glow.take() {
+            Some(e) => e,
+            None => {
+                self.gl_window = Some(gl_window);
+                return;
+            }
+        };
+        let gl = self.gl.clone();
+
+        egui_glow.run(&gl_window.window, |ctx| {
+            self.render_ui(ctx);
+        });
+
+        if let Some(gl) = &gl {
+            unsafe {
+                use glow::HasContext as _;
+                gl.clear_color(0.1, 0.1, 0.1, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        }
+
+        egui_glow.paint(&gl_window.window);
+        gl_window.swap_buffers();
+
+        self.gl_window = Some(gl_window);
+        self.egui_glow = Some(egui_glow);
     }
+}
+
+// ── ApplicationHandler ──
+
+impl winit::application::ApplicationHandler<AppUserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gl_window.is_none() {
+            self.create_window(event_loop);
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppUserEvent) {
+        match event {
+            AppUserEvent::Tray(TrayEvent::Show) => {
+                if self.gl_window.is_some() {
+                    let win = self.gl_window.as_ref().unwrap();
+                    win.window.set_visible(true);
+                    win.window.focus_window();
+                    win.window.request_redraw();
+                } else {
+                    self.create_window(event_loop);
+                }
+            }
+            AppUserEvent::Tray(TrayEvent::Sync) => {
+                self.save_settings();
+                let _ = self.commands.send(BackendCommand::SyncNow);
+            }
+            AppUserEvent::Tray(TrayEvent::Quit) => {
+                self.quitting = true;
+                let _ = self.commands.send(BackendCommand::Shutdown);
+                event_loop.exit();
+            }
+            AppUserEvent::Redraw(delay) => {
+                self.repaint_delay = delay;
+                if self.gl_window.is_some() {
+                    self.gl_window.as_ref().unwrap().window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {
+        self.poll_backend_events();
+        if self.gl_window.is_some() {
+            let next = std::time::Instant::now()
+                + std::cmp::min(self.repaint_delay, std::time::Duration::from_millis(500));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+            if self.quitting {
+                event_loop.exit();
+            } else {
+                self.record_activity("Closed window to the system tray".into());
+                self.destroy_window();
+            }
+            return;
+        }
+
+        if let WindowEvent::Resized(size) = &event {
+            if let Some(gl_window) = self.gl_window.as_mut() {
+                gl_window.resize(*size);
+            }
+        }
+
+        if event == WindowEvent::RedrawRequested {
+            self.redraw();
+            return;
+        }
+
+        let Some(gl_window) = self.gl_window.as_mut() else {
+            return;
+        };
+        let Some(egui_glow) = self.egui_glow.as_mut() else {
+            return;
+        };
+
+        let response = egui_glow.on_window_event(&gl_window.window, &event);
+        if response.repaint {
+            gl_window.window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(mut eg) = self.egui_glow.take() {
+            eg.destroy();
+        }
+    }
+}
+
+// ── Tray ──
+
+struct CloudreveTray {
+    proxy: EventLoopProxy<AppUserEvent>,
+    icon: Vec<ksni::Icon>,
+}
+
+impl ksni::Tray for CloudreveTray {
+    fn id(&self) -> String {
+        "cloudreve-sync".into()
+    }
+
+    fn title(&self) -> String {
+        "Cloudreve Sync".into()
+    }
+
+    fn icon_name(&self) -> String {
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.icon.clone()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.proxy.send_event(AppUserEvent::Tray(TrayEvent::Show));
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        vec![
+            StandardItem {
+                label: "Show Cloudreve Sync".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.proxy.send_event(AppUserEvent::Tray(TrayEvent::Show));
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Sync now".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.proxy.send_event(AppUserEvent::Tray(TrayEvent::Sync));
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.proxy.send_event(AppUserEvent::Tray(TrayEvent::Quit));
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+fn create_tray(
+    proxy: EventLoopProxy<AppUserEvent>,
+) -> anyhow::Result<ksni::blocking::Handle<CloudreveTray>> {
+    let image = image::load_from_memory(include_bytes!("../logo-sync.png"))?.into_rgba8();
+    let image = image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3);
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    let argb = rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]])
+        .collect();
+    let tray = ksni::blocking::TrayMethods::spawn(CloudreveTray {
+        proxy,
+        icon: vec![ksni::Icon {
+            width: width as i32,
+            height: height as i32,
+            data: argb,
+        }],
+    })?;
+    Ok(tray)
+}
+
+// ── Helpers ──
+
+fn app_icon() -> (Vec<u8>, u32, u32) {
+    let image = image::load_from_memory(include_bytes!("../logo-sync.png"))
+        .expect("embedded application logo must be a valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    (image.into_raw(), width, height)
+}
+
+fn direction_label(direction: TransferDirection) -> &'static str {
+    match direction {
+        TransferDirection::Upload => "Uploading",
+        TransferDirection::Download => "Downloading",
+        TransferDirection::DeleteLocal => "Deleting locally",
+        TransferDirection::DeleteRemote => "Deleting remotely",
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+// ── Main ──
+
+fn main() -> anyhow::Result<()> {
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(sync::run(commands_rx, events_tx));
+    });
+
+    let event_loop = EventLoop::<AppUserEvent>::with_user_event().build()?;
+    let proxy = event_loop.create_proxy();
+
+    let tray = create_tray(proxy.clone())?;
+    let app = App::new(commands_tx, events_rx, proxy, tray);
+    event_loop.run_app(&mut std::convert::identity(app))?;
+    Ok(())
 }
