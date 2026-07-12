@@ -11,17 +11,13 @@ use model::{
     TransferDirection,
 };
 use std::collections::{BTreeMap, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use tokio::sync::mpsc;
-use tray_icon::{
-    menu::{Menu, MenuEvent, MenuId, MenuItem},
-    Icon, TrayIcon, TrayIconBuilder,
-};
 use uuid::Uuid;
 
-fn main() -> eframe::Result {
-    let _ = gtk::init();
+fn main() -> anyhow::Result<()> {
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -29,26 +25,71 @@ fn main() -> eframe::Result {
             .unwrap()
             .block_on(sync::run(commands_rx, events_tx));
     });
-    let (icon_rgba, icon_width, icon_height) = app_icon();
-    let options = eframe::NativeOptions {
+    let (tray, tray_events) = create_tray()?;
+    let tray_events = Arc::new(Mutex::new(tray_events));
+    let mut state = Some(SyncState::new(commands_tx.clone(), events_rx));
+    loop {
+        let (state_tx, state_rx) = std_mpsc::channel();
+        let app_state = state.take().expect("application state must be available");
+        let options = native_options();
+        let app_tray_events = tray_events.clone();
+        eframe::run_native(
+            "Cloudreve Sync",
+            options,
+            Box::new(move |cc| {
+                cc.egui_ctx.set_visuals(egui::Visuals::dark());
+                Ok(Box::new(SyncApp {
+                    state: Some(app_state),
+                    state_tx,
+                    tray_events: app_tray_events,
+                    quitting: false,
+                }))
+            }),
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let (returned_state, quitting) = state_rx
+            .recv()
+            .expect("window must return application state");
+        state = Some(returned_state);
+        if quitting {
+            let _ = commands_tx.send(BackendCommand::Shutdown);
+            drop(tray);
+            return Ok(());
+        }
+        loop {
+            match tray_events.lock().unwrap().recv() {
+                Ok(TrayEvent::Show) => break,
+                Ok(TrayEvent::Sync) => {
+                    let _ = commands_tx.send(BackendCommand::SyncNow);
+                }
+                Ok(TrayEvent::Quit) | Err(_) => {
+                    let _ = commands_tx.send(BackendCommand::Shutdown);
+                    drop(tray);
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn native_options() -> eframe::NativeOptions {
+    let (rgba, width, height) = app_icon();
+    eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_title("Cloudreve Sync")
+            .with_app_id("cloudreve-sync")
             .with_inner_size([720.0, 560.0])
             .with_min_inner_size([560.0, 420.0])
             .with_icon(Arc::new(egui::IconData {
-                rgba: icon_rgba,
-                width: icon_width,
-                height: icon_height,
+                rgba,
+                width,
+                height,
             })),
         ..Default::default()
-    };
-    eframe::run_native(
-        "Cloudreve Sync",
-        options,
-        Box::new(|cc| Ok(Box::new(SyncApp::new(cc, commands_tx, events_rx)?))),
-    )
+    }
 }
 
-struct SyncApp {
+struct SyncState {
     config: AppConfig,
     commands: mpsc::UnboundedSender<BackendCommand>,
     events: mpsc::UnboundedReceiver<BackendEvent>,
@@ -61,13 +102,28 @@ struct SyncApp {
     uploads: usize,
     downloads: usize,
     transferred_bytes: u64,
-    _tray: TrayIcon,
-    tray_show: MenuId,
-    tray_sync: MenuId,
-    tray_quit: MenuId,
-    quitting: bool,
-    hide_window_next_frame: bool,
     folder_selection: Option<FolderSelection>,
+}
+
+struct SyncApp {
+    state: Option<SyncState>,
+    state_tx: std_mpsc::Sender<(SyncState, bool)>,
+    tray_events: Arc<Mutex<std_mpsc::Receiver<TrayEvent>>>,
+    quitting: bool,
+}
+
+impl Deref for SyncApp {
+    type Target = SyncState;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for SyncApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state.as_mut().unwrap()
+    }
 }
 
 struct FolderSelection {
@@ -76,15 +132,12 @@ struct FolderSelection {
     folders: Vec<(PathBuf, bool)>,
 }
 
-impl SyncApp {
+impl SyncState {
     fn new(
-        cc: &eframe::CreationContext<'_>,
         commands: mpsc::UnboundedSender<BackendCommand>,
         events: mpsc::UnboundedReceiver<BackendEvent>,
-    ) -> anyhow::Result<Self> {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let (tray, tray_show, tray_sync, tray_quit) = create_tray()?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             config: storage::load_config(),
             commands,
             events,
@@ -97,17 +150,11 @@ impl SyncApp {
             uploads: 0,
             downloads: 0,
             transferred_bytes: 0,
-            _tray: tray,
-            tray_show,
-            tray_sync,
-            tray_quit,
-            quitting: false,
-            hide_window_next_frame: false,
             folder_selection: None,
-        })
+        }
     }
 
-    fn save(&mut self) {
+    fn save_settings(&mut self) {
         if let Err(error) = autostart::set_enabled(self.config.autostart) {
             self.errors
                 .push(format!("Could not update autostart: {error}"));
@@ -182,26 +229,92 @@ impl SyncApp {
     }
 }
 
-fn create_tray() -> anyhow::Result<(TrayIcon, MenuId, MenuId, MenuId)> {
-    let menu = Menu::new();
-    let show = MenuItem::new("Show Cloudreve Sync", true, None);
-    let sync = MenuItem::new("Sync now", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    menu.append_items(&[&show, &sync, &quit])?;
-    let (rgba, width, height) = app_icon();
-    let icon = Icon::from_rgba(rgba, width, height)?;
-    let tray = TrayIconBuilder::new()
-        .with_title("Cloudreve Sync")
-        .with_tooltip("Cloudreve Sync")
-        .with_icon(icon)
-        .with_menu(Box::new(menu))
-        .build()?;
-    Ok((
-        tray,
-        show.id().clone(),
-        sync.id().clone(),
-        quit.id().clone(),
-    ))
+#[derive(Clone, Copy)]
+enum TrayEvent {
+    Show,
+    Sync,
+    Quit,
+}
+
+struct CloudreveTray {
+    events: std_mpsc::Sender<TrayEvent>,
+    icon: Vec<ksni::Icon>,
+}
+
+impl ksni::Tray for CloudreveTray {
+    fn id(&self) -> String {
+        "cloudreve-sync".into()
+    }
+
+    fn title(&self) -> String {
+        "Cloudreve Sync".into()
+    }
+
+    fn icon_name(&self) -> String {
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.icon.clone()
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let _ = self.events.send(TrayEvent::Show);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        vec![
+            StandardItem {
+                label: "Show Cloudreve Sync".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.events.send(TrayEvent::Show);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Sync now".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.events.send(TrayEvent::Sync);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|tray: &mut Self| {
+                    let _ = tray.events.send(TrayEvent::Quit);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+fn create_tray() -> anyhow::Result<(
+    ksni::blocking::Handle<CloudreveTray>,
+    std_mpsc::Receiver<TrayEvent>,
+)> {
+    let image = image::load_from_memory(include_bytes!("../logo-sync.png"))?.into_rgba8();
+    let image = image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Lanczos3);
+    let (width, height) = image.dimensions();
+    let rgba = image.into_raw();
+    let argb = rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| [pixel[3], pixel[0], pixel[1], pixel[2]])
+        .collect();
+    let (events, receiver) = std_mpsc::channel();
+    let tray = ksni::blocking::TrayMethods::spawn(CloudreveTray {
+        events,
+        icon: vec![ksni::Icon {
+            width: width as i32,
+            height: height as i32,
+            data: argb,
+        }],
+    })?;
+    Ok((tray, receiver))
 }
 
 fn app_icon() -> (Vec<u8>, u32, u32) {
@@ -238,30 +351,25 @@ fn format_bytes(bytes: u64) -> String {
 
 impl eframe::App for SyncApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        if self.hide_window_next_frame {
-            self.hide_window_next_frame = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        }
-        while gtk::events_pending() {
-            gtk::main_iteration_do(false);
-        }
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.tray_show {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if event.id == self.tray_sync {
-                self.save();
-                let _ = self.commands.send(BackendCommand::SyncNow);
-            } else if event.id == self.tray_quit {
-                self.quitting = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        loop {
+            let event = self.tray_events.lock().unwrap().try_recv();
+            let Ok(event) = event else { break };
+            match event {
+                TrayEvent::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayEvent::Sync => {
+                    self.save_settings();
+                    let _ = self.commands.send(BackendCommand::SyncNow);
+                }
+                TrayEvent::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
         if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window_next_frame = true;
-            ctx.request_repaint();
-            self.record_activity("Closing window to the system tray".into());
+            self.record_activity("Closed window to the system tray".into());
         }
         while let Ok(event) = self.events.try_recv() {
             match event {
@@ -318,6 +426,7 @@ impl eframe::App for SyncApp {
             }
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
+
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Cloudreve Sync");
@@ -447,10 +556,10 @@ impl eframe::App for SyncApp {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     if ui.button("Save settings").clicked() {
-                        self.save();
+                        self.save_settings();
                     }
                     if ui.button("Sync now").clicked() {
-                        self.save();
+                        self.save_settings();
                         let _ = self.commands.send(BackendCommand::SyncNow);
                     }
                 });
@@ -570,6 +679,8 @@ impl eframe::App for SyncApp {
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
-        let _ = self.commands.send(BackendCommand::Shutdown);
+        let _ = self
+            .state_tx
+            .send((self.state.take().unwrap(), self.quitting));
     }
 }

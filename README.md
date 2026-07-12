@@ -43,7 +43,7 @@ install it with `nix run .` or `nix profile install .`.
 On Debian/Ubuntu, eframe normally needs:
 
 ```sh
-sudo apt install build-essential pkg-config libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libgtk-3-dev libayatana-appindicator3-dev
+sudo apt install build-essential pkg-config libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev
 ```
 
 ## Setup

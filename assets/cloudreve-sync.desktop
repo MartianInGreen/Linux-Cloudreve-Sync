@@ -4,5 +4,6 @@ Name=Cloudreve Sync
 Comment=Synchronize folders with Cloudreve
 Exec=cloudreve-sync
 Icon=cloudreve-sync
+StartupWMClass=cloudreve-sync
 Terminal=false
 Categories=Network;FileTransfer;

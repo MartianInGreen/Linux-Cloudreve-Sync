@@ -3,9 +3,6 @@
 , pkg-config
 , clang
 , cmake
-, wrapGAppsHook3
-, gtk3
-, libayatana-appindicator
 , libxkbcommon
 , libGL
 }:
@@ -21,12 +18,9 @@ rustPlatform.buildRustPackage {
     pkg-config
     clang
     cmake
-    wrapGAppsHook3
   ];
 
   buildInputs = [
-    gtk3
-    libayatana-appindicator
     libxkbcommon
     libGL
   ];
