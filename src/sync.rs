@@ -185,6 +185,30 @@ async fn sync_mapping(
         let local_changed = old.map_or(local_hash.is_some(), |s| s.local_hash != local_hash);
         let remote_changed = old.map_or(remote_tag.is_some(), |s| s.remote_tag != remote_tag);
 
+        if old.is_none() || !local_changed {
+            if let (Some(local_hash), Some(entry)) = (local_hash.as_ref(), remote_entry) {
+                if local_size_matches_remote(mapping, &path, entry) {
+                    previous.insert(
+                        path,
+                        EntryState {
+                            local_hash: Some(local_hash.clone()),
+                            remote_tag,
+                        },
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if local_changed {
+            if let (Some(_), Some(entry), Some(_)) = (local_hash.as_ref(), remote_entry, old) {
+                if local_size_matches_remote(mapping, &path, entry) {
+                    upload(dav, mapping, &path, events).await?;
+                    continue;
+                }
+            }
+        }
+
         match (
             local_hash.as_ref(),
             remote_entry,
@@ -437,6 +461,7 @@ async fn resolve(
             let entry = RemoteEntry {
                 tag: String::new(),
                 is_dir: false,
+                size: None,
                 relative_path: conflict
                     .remote_path
                     .clone()
@@ -538,6 +563,13 @@ fn hash_bytes(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
+fn local_size_matches_remote(mapping: &SyncMapping, relative: &str, entry: &RemoteEntry) -> bool {
+    entry.size.is_some_and(|remote_size| {
+        std::fs::metadata(mapping.local_path.join(relative))
+            .is_ok_and(|metadata| metadata.len() == remote_size)
+    })
+}
+
 fn mapping_paths_changed(old: &SyncMapping, new: &SyncMapping) -> bool {
     old.local_path != new.local_path
         || old.remote_path.trim_matches('/') != new.remote_path.trim_matches('/')
@@ -593,6 +625,7 @@ mod tests {
         let entry = RemoteEntry {
             tag: "etag".into(),
             is_dir: false,
+            size: None,
             relative_path: "course/page.html.dissalowed-type".into(),
         };
         let remote =
@@ -633,5 +666,28 @@ mod tests {
         assert!(!valid_remote_segment("Übung: Fluidtechnik"));
         assert!(!valid_remote_segment("trailing."));
         assert!(!valid_remote_segment("question?"));
+    }
+
+    #[test]
+    fn matches_local_and_remote_file_sizes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("large.iso"), b"12345678").unwrap();
+        let mapping = SyncMapping {
+            id: Uuid::new_v4(),
+            local_path: directory.path().into(),
+            remote_path: "documents".into(),
+            enabled: true,
+            ignore_patterns: String::new(),
+        };
+        let mut entry = RemoteEntry {
+            tag: "new-etag".into(),
+            is_dir: false,
+            size: Some(8),
+            relative_path: "large.iso".into(),
+        };
+
+        assert!(local_size_matches_remote(&mapping, "large.iso", &entry));
+        entry.size = Some(9);
+        assert!(!local_size_matches_remote(&mapping, "large.iso", &entry));
     }
 }

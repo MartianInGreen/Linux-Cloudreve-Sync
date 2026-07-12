@@ -12,6 +12,7 @@ use url::Url;
 pub struct RemoteEntry {
     pub tag: String,
     pub is_dir: bool,
+    pub size: Option<u64>,
     pub relative_path: String,
 }
 
@@ -109,27 +110,54 @@ impl WebDavClient {
     }
 
     async fn list_one(&self, path: &str) -> Result<Vec<(String, RemoteEntry)>> {
-        let response = self
-            .request(Method::from_bytes(b"PROPFIND")?, path)?
-            .header("Depth", "1")
-            .send()
-            .await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(Vec::new());
+        for attempt in 0..3 {
+            let response = self
+                .request(Method::from_bytes(b"PROPFIND")?, path)?
+                .header("Depth", "1")
+                .send()
+                .await
+                .with_context(|| format!("requesting WebDAV listing for {path}"))?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Ok(Vec::new());
+            }
+            if response.status() != StatusCode::MULTI_STATUS && !response.status().is_success() {
+                bail!("listing {path} returned {}", response.status());
+            }
+            match response.bytes().await {
+                Ok(body) => return parse_multistatus(&body, &self.base),
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading WebDAV listing response for {path}"));
+                }
+            }
         }
-        if response.status() != StatusCode::MULTI_STATUS && !response.status().is_success() {
-            bail!("listing {path} returned {}", response.status());
-        }
-        parse_multistatus(&response.bytes().await?, &self.base)
+        unreachable!()
     }
 
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
-        let response = self
-            .request(Method::GET, path)?
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(response.bytes().await?.to_vec())
+        for attempt in 0..3 {
+            let response = self
+                .request(Method::GET, path)?
+                .send()
+                .await
+                .with_context(|| format!("requesting remote file {path}"))?
+                .error_for_status()
+                .with_context(|| format!("downloading remote file {path}"))?;
+            match response.bytes().await {
+                Ok(body) => return Ok(body.to_vec()),
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading remote file response for {path}"));
+                }
+            }
+        }
+        unreachable!()
     }
 
     pub async fn upload(&self, path: &str, data: Vec<u8>) -> Result<()> {
@@ -179,13 +207,14 @@ fn parse_multistatus(body: &[u8], base: &Url) -> Result<Vec<(String, RemoteEntry
     let mut reader = Reader::from_reader(body);
     reader.config_mut().trim_text(true);
     let mut entries = Vec::new();
-    let (mut href, mut tag, mut is_dir) = (None, None, false);
+    let (mut href, mut tag, mut size, mut is_dir) = (None, None, None, false);
     loop {
         match reader.read_event()? {
             Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"response" => {
                     href = None;
                     tag = None;
+                    size = None;
                     is_dir = false;
                 }
                 b"href" => {
@@ -195,6 +224,9 @@ fn parse_multistatus(body: &[u8], base: &Url) -> Result<Vec<(String, RemoteEntry
                 b"getetag" => {
                     let text = reader.read_text(e.name())?;
                     tag = Some(quick_xml::escape::unescape(&text)?.into_owned());
+                }
+                b"getcontentlength" => {
+                    size = reader.read_text(e.name())?.parse().ok();
                 }
                 b"collection" => is_dir = true,
                 _ => {}
@@ -215,6 +247,7 @@ fn parse_multistatus(body: &[u8], base: &Url) -> Result<Vec<(String, RemoteEntry
                         RemoteEntry {
                             tag: tag.take().unwrap_or_default(),
                             is_dir,
+                            size,
                             relative_path: String::new(),
                         },
                     ));
@@ -270,7 +303,7 @@ mod tests {
             <d:multistatus xmlns:d="DAV:">
                 <d:response>
                     <d:href>/dav/Home/Pictures/NASA%E2%80%99s_SLS_&amp;_Falcon_9.jpg</d:href>
-                    <d:propstat><d:prop><d:getetag>&quot;picture-tag&quot;</d:getetag></d:prop></d:propstat>
+                    <d:propstat><d:prop><d:getetag>&quot;picture-tag&quot;</d:getetag><d:getcontentlength>1234</d:getcontentlength></d:prop></d:propstat>
                 </d:response>
                 <d:response>
                     <d:href>/dav/Home/Documents/Data%20Engineering%20&amp;%20Science%20by%20O'Reilly.md</d:href>
@@ -281,6 +314,7 @@ mod tests {
 
         assert_eq!(entries[0].0, "Pictures/NASA’s_SLS_&_Falcon_9.jpg");
         assert_eq!(entries[0].1.tag, "\"picture-tag\"");
+        assert_eq!(entries[0].1.size, Some(1234));
         assert_eq!(
             entries[1].0,
             "Documents/Data Engineering & Science by O'Reilly.md"
