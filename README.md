@@ -50,6 +50,7 @@ to the other side automatically. If both copies changed since the snapshot, the
 app pauses that file and displays a conflict with **Keep local** and **Keep
 remote** actions.
 
-If Cloudreve rejects a filename during upload, the app encodes its filename into
-a storage-safe form and appends `.dissalowed-type`. The encoding and suffix are
-removed when the file is downloaded, restoring the exact original local name.
+If Cloudreve rejects a path during upload, the app encodes unsafe folder names
+with `.dissalowed-folder` and encodes the filename with `.dissalowed-type`. The
+encoding and suffixes are removed when files are downloaded, restoring the exact
+original local path.

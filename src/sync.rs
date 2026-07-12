@@ -265,11 +265,28 @@ async fn upload(
         bytes: Some(data.len() as u64),
     };
     let _ = events.send(BackendEvent::TransferStarted(transfer.clone()));
-    let result = match dav
-        .upload(&remote_file(mapping, relative), data.clone())
-        .await
-    {
+    let has_invalid_folder = relative.rsplit_once('/').is_some_and(|(parent, _)| {
+        parent
+            .split('/')
+            .any(|segment| !valid_remote_segment(segment))
+    });
+    let initial_result = if has_invalid_folder {
+        let fallback = safe_remote_path(relative);
+        let _ = events.send(BackendEvent::Status(format!(
+            "Uploading {relative} using storage-safe folder names"
+        )));
+        dav.upload(&remote_file(mapping, &fallback), data.clone())
+            .await
+    } else {
+        dav.upload(&remote_file(mapping, relative), data.clone())
+            .await
+    };
+    let result = match initial_result {
         Ok(()) => Ok(()),
+        Err(error) if has_invalid_folder => Err(anyhow!(
+            "safe-path upload of {relative} as {} failed: {error}",
+            safe_remote_path(relative)
+        )),
         Err(original_error) => {
             let fallback = safe_remote_path(relative);
             let _ = events.send(BackendEvent::Status(format!(
@@ -428,34 +445,61 @@ fn canonical_remote_entries(
 }
 
 fn safe_remote_path(path: &str) -> String {
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    let safe_name = format!(
-        "cloudreve-sync-{}.dissalowed-type",
-        URL_SAFE_NO_PAD.encode(name.as_bytes())
-    );
-    if parent.is_empty() {
-        safe_name
-    } else {
-        format!("{parent}/{safe_name}")
-    }
+    let mut segments: Vec<_> = path.split('/').collect();
+    let name = segments.pop().unwrap_or_default();
+    let mut safe_segments: Vec<String> = segments
+        .into_iter()
+        .map(|segment| {
+            if valid_remote_segment(segment) {
+                segment.to_string()
+            } else {
+                encode_remote_segment(segment, ".dissalowed-folder")
+            }
+        })
+        .collect();
+    safe_segments.push(encode_remote_segment(name, ".dissalowed-type"));
+    safe_segments.join("/")
 }
 
 fn canonical_remote_path(path: &str) -> String {
-    let Some(without_suffix) = path.strip_suffix(".dissalowed-type") else {
-        return path.to_string();
-    };
-    let (parent, name) = without_suffix
-        .rsplit_once('/')
-        .unwrap_or(("", without_suffix));
-    let decoded = name
+    path.split('/')
+        .map(|segment| {
+            decode_remote_segment(segment, ".dissalowed-folder")
+                .or_else(|| decode_remote_segment(segment, ".dissalowed-type"))
+                .unwrap_or_else(|| {
+                    segment
+                        .strip_suffix(".dissalowed-type")
+                        .unwrap_or(segment)
+                        .to_string()
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn valid_remote_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && !segment.ends_with([' ', '.'])
+        && !segment
+            .chars()
+            .any(|character| character.is_control() || r#"<>:"\|?*"#.contains(character))
+}
+
+fn encode_remote_segment(segment: &str, suffix: &str) -> String {
+    format!(
+        "cloudreve-sync-{}{suffix}",
+        URL_SAFE_NO_PAD.encode(segment.as_bytes())
+    )
+}
+
+fn decode_remote_segment(segment: &str, suffix: &str) -> Option<String> {
+    segment
+        .strip_suffix(suffix)?
         .strip_prefix("cloudreve-sync-")
         .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok());
-    match decoded {
-        Some(name) if parent.is_empty() => name,
-        Some(name) => format!("{parent}/{name}"),
-        None => without_suffix.to_string(),
-    }
+        .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
 fn hash_bytes(data: &[u8]) -> String {
@@ -536,5 +580,24 @@ mod tests {
         assert!(!safe.contains(' '));
         assert!(safe.ends_with(".dissalowed-type"));
         assert_eq!(canonical_remote_path(&safe), original);
+    }
+
+    #[test]
+    fn invalid_folder_round_trips_through_safe_remote_name() {
+        let original = "Übungsunterlagen/Übung: Fluidtechnik - Kopie/Fluidtechnik.pdf";
+        let safe = safe_remote_path(original);
+
+        assert!(safe.starts_with("Übungsunterlagen/cloudreve-sync-"));
+        assert!(safe.contains(".dissalowed-folder/"));
+        assert!(!safe.contains("Übung:"));
+        assert_eq!(canonical_remote_path(&safe), original);
+    }
+
+    #[test]
+    fn detects_reserved_remote_path_characters() {
+        assert!(valid_remote_segment("Übungsunterlagen"));
+        assert!(!valid_remote_segment("Übung: Fluidtechnik"));
+        assert!(!valid_remote_segment("trailing."));
+        assert!(!valid_remote_segment("question?"));
     }
 }
