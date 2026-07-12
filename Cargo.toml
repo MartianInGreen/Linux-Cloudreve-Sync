@@ -1,0 +1,32 @@
+[package]
+name = "cloudreve-sync"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A small two-way Cloudreve desktop sync client"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.8"
+dirs = "6.0"
+eframe = "0.31"
+libsql = "0.9"
+percent-encoding = "2.3"
+quick-xml = { version = "0.37", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.43", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+url = "2.5"
+uuid = { version = "1.12", features = ["v4", "serde"] }
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+strip = true
