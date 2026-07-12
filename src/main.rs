@@ -1,3 +1,4 @@
+mod autostart;
 mod local_index;
 mod model;
 mod storage;
@@ -10,10 +11,17 @@ use model::{
     TransferDirection,
 };
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tray_icon::{
+    menu::{Menu, MenuEvent, MenuId, MenuItem},
+    Icon, TrayIcon, TrayIconBuilder,
+};
 use uuid::Uuid;
 
 fn main() -> eframe::Result {
+    let _ = gtk::init();
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
@@ -21,16 +29,22 @@ fn main() -> eframe::Result {
             .unwrap()
             .block_on(sync::run(commands_rx, events_tx));
     });
+    let (icon_rgba, icon_width, icon_height) = app_icon();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([560.0, 420.0]),
+            .with_min_inner_size([560.0, 420.0])
+            .with_icon(Arc::new(egui::IconData {
+                rgba: icon_rgba,
+                width: icon_width,
+                height: icon_height,
+            })),
         ..Default::default()
     };
     eframe::run_native(
         "Cloudreve Sync",
         options,
-        Box::new(|cc| Ok(Box::new(SyncApp::new(cc, commands_tx, events_rx)))),
+        Box::new(|cc| Ok(Box::new(SyncApp::new(cc, commands_tx, events_rx)?))),
     )
 }
 
@@ -47,6 +61,19 @@ struct SyncApp {
     uploads: usize,
     downloads: usize,
     transferred_bytes: u64,
+    _tray: TrayIcon,
+    tray_show: MenuId,
+    tray_sync: MenuId,
+    tray_quit: MenuId,
+    quitting: bool,
+    hide_window_next_frame: bool,
+    folder_selection: Option<FolderSelection>,
+}
+
+struct FolderSelection {
+    root: PathBuf,
+    remote_parent: String,
+    folders: Vec<(PathBuf, bool)>,
 }
 
 impl SyncApp {
@@ -54,9 +81,10 @@ impl SyncApp {
         cc: &eframe::CreationContext<'_>,
         commands: mpsc::UnboundedSender<BackendCommand>,
         events: mpsc::UnboundedReceiver<BackendEvent>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        Self {
+        let (tray, tray_show, tray_sync, tray_quit) = create_tray()?;
+        Ok(Self {
             config: storage::load_config(),
             commands,
             events,
@@ -69,10 +97,22 @@ impl SyncApp {
             uploads: 0,
             downloads: 0,
             transferred_bytes: 0,
-        }
+            _tray: tray,
+            tray_show,
+            tray_sync,
+            tray_quit,
+            quitting: false,
+            hide_window_next_frame: false,
+            folder_selection: None,
+        })
     }
 
     fn save(&mut self) {
+        if let Err(error) = autostart::set_enabled(self.config.autostart) {
+            self.errors
+                .push(format!("Could not update autostart: {error}"));
+            return;
+        }
         match storage::save_config(&self.config) {
             Ok(()) => {
                 let _ = self
@@ -84,10 +124,92 @@ impl SyncApp {
         }
     }
 
+    fn choose_folder_group(&mut self) {
+        let Some(root) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        match std::fs::read_dir(&root) {
+            Ok(entries) => {
+                let mut folders: Vec<_> = entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .map(|entry| (entry.path(), false))
+                    .collect();
+                folders.sort_by(|left, right| left.0.file_name().cmp(&right.0.file_name()));
+                self.folder_selection = Some(FolderSelection {
+                    root,
+                    remote_parent: String::new(),
+                    folders,
+                });
+            }
+            Err(error) => self.errors.push(format!("Could not read folder: {error}")),
+        }
+    }
+
+    fn add_selected_folders(&mut self, selection: FolderSelection) {
+        for (path, selected) in selection.folders {
+            if !selected
+                || self
+                    .config
+                    .mappings
+                    .iter()
+                    .any(|mapping| mapping.local_path == path)
+            {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            let remote_path = if selection.remote_parent.trim_matches('/').is_empty() {
+                name.into_owned()
+            } else {
+                format!("{}/{}", selection.remote_parent.trim_matches('/'), name)
+            };
+            self.config.mappings.push(SyncMapping {
+                id: Uuid::new_v4(),
+                local_path: path,
+                remote_path,
+                enabled: true,
+                ignore_patterns: String::new(),
+            });
+        }
+    }
+
     fn record_activity(&mut self, message: String) {
         self.activity.push_front(message);
         self.activity.truncate(12);
     }
+}
+
+fn create_tray() -> anyhow::Result<(TrayIcon, MenuId, MenuId, MenuId)> {
+    let menu = Menu::new();
+    let show = MenuItem::new("Show Cloudreve Sync", true, None);
+    let sync = MenuItem::new("Sync now", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+    menu.append_items(&[&show, &sync, &quit])?;
+    let (rgba, width, height) = app_icon();
+    let icon = Icon::from_rgba(rgba, width, height)?;
+    let tray = TrayIconBuilder::new()
+        .with_title("Cloudreve Sync")
+        .with_tooltip("Cloudreve Sync")
+        .with_icon(icon)
+        .with_menu(Box::new(menu))
+        .build()?;
+    Ok((
+        tray,
+        show.id().clone(),
+        sync.id().clone(),
+        quit.id().clone(),
+    ))
+}
+
+fn app_icon() -> (Vec<u8>, u32, u32) {
+    let image = image::load_from_memory(include_bytes!("../logo-sync.png"))
+        .expect("embedded application logo must be a valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    (image.into_raw(), width, height)
 }
 
 fn direction_label(direction: TransferDirection) -> &'static str {
@@ -116,6 +238,31 @@ fn format_bytes(bytes: u64) -> String {
 
 impl eframe::App for SyncApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        if self.hide_window_next_frame {
+            self.hide_window_next_frame = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == self.tray_show {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else if event.id == self.tray_sync {
+                self.save();
+                let _ = self.commands.send(BackendCommand::SyncNow);
+            } else if event.id == self.tray_quit {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window_next_frame = true;
+            ctx.request_repaint();
+            self.record_activity("Closing window to the system tray".into());
+        }
         while let Ok(event) = self.events.try_recv() {
             match event {
                 BackendEvent::Status(status) => self.status = status,
@@ -244,6 +391,12 @@ impl eframe::App for SyncApp {
                         ui.label("Check every (seconds)");
                         ui.add(egui::DragValue::new(&mut self.config.poll_seconds).range(2..=3600));
                         ui.end_row();
+                        ui.label("Desktop");
+                        ui.checkbox(
+                            &mut self.config.autostart,
+                            "Start automatically when I sign in",
+                        );
+                        ui.end_row();
                     });
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
@@ -255,8 +408,12 @@ impl eframe::App for SyncApp {
                                 local_path: path,
                                 remote_path: String::new(),
                                 enabled: true,
+                                ignore_patterns: String::new(),
                             });
                         }
+                    }
+                    if ui.button("Add some folders...").clicked() {
+                        self.choose_folder_group();
                     }
                 });
                 let mut remove = None;
@@ -276,6 +433,12 @@ impl eframe::App for SyncApp {
                             ui.label("Remote");
                             ui.text_edit_singleline(&mut mapping.remote_path);
                         });
+                        ui.label("Ignore patterns (one gitignore-style pattern per line)");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut mapping.ignore_patterns)
+                                .desired_rows(2)
+                                .hint_text("*.tmp\n.cache/\n**/target/"),
+                        );
                     });
                 }
                 if let Some(index) = remove {
@@ -348,6 +511,62 @@ impl eframe::App for SyncApp {
                 }
             });
         });
+
+        if let Some(mut selection) = self.folder_selection.take() {
+            let mut open = true;
+            let mut add = false;
+            egui::Window::new("Add some folders")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.label("Top folder");
+                    ui.monospace(selection.root.display().to_string());
+                    ui.add_space(8.0);
+                    ui.label("Remote parent folder");
+                    ui.text_edit_singleline(&mut selection.remote_parent);
+                    ui.label("Each selected folder will be mapped below this remote folder.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Select all").clicked() {
+                            for (_, selected) in &mut selection.folders {
+                                *selected = true;
+                            }
+                        }
+                        if ui.small_button("Select none").clicked() {
+                            for (_, selected) in &mut selection.folders {
+                                *selected = false;
+                            }
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (path, selected) in &mut selection.folders {
+                                let name = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy())
+                                    .unwrap_or_default();
+                                ui.checkbox(selected, name);
+                            }
+                        });
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            selection.folders.iter().any(|(_, selected)| *selected),
+                            egui::Button::new("Add selected folders"),
+                        )
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                });
+            if add {
+                self.add_selected_folders(selection);
+            } else if open {
+                self.folder_selection = Some(selection);
+            }
+        }
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {

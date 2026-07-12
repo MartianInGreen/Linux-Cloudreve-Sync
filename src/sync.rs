@@ -1,5 +1,5 @@
 use crate::{
-    local_index::LocalIndex,
+    local_index::{build_ignores, LocalIndex},
     model::{
         AppConfig, BackendCommand, BackendEvent, Conflict, ConflictChoice, EntryState, SyncMapping,
         SyncState, Transfer, TransferDirection,
@@ -157,12 +157,20 @@ async fn sync_mapping(
         "Scanning local files in {}...",
         mapping.local_path.display()
     )));
-    let local = index.scan(mapping.id, &mapping.local_path).await?;
+    let ignores = build_ignores(&mapping.local_path, &mapping.ignore_patterns)?;
+    let local = index
+        .scan(mapping.id, &mapping.local_path, &ignores)
+        .await?;
     let _ = events.send(BackendEvent::Status(format!(
         "Reading Cloudreve folder /{}...",
         mapping.remote_path.trim_matches('/')
     )));
-    let remote = canonical_remote_entries(dav.list_recursive(&mapping.remote_path).await?);
+    let mut remote = canonical_remote_entries(dav.list_recursive(&mapping.remote_path).await?);
+    remote.retain(|path, entry| {
+        !ignores
+            .matched_path_or_any_parents(path, entry.is_dir)
+            .is_ignore()
+    });
     let previous = state.mappings.entry(mapping.id).or_default();
     let mut conflicted = BTreeSet::new();
     let paths: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
@@ -224,9 +232,16 @@ async fn sync_mapping(
             _ => {}
         }
     }
-    let refreshed_local = index.scan(mapping.id, &mapping.local_path).await?;
-    let refreshed_remote =
+    let refreshed_local = index
+        .scan(mapping.id, &mapping.local_path, &ignores)
+        .await?;
+    let mut refreshed_remote =
         canonical_remote_entries(dav.list_recursive(&mapping.remote_path).await?);
+    refreshed_remote.retain(|path, entry| {
+        !ignores
+            .matched_path_or_any_parents(path, entry.is_dir)
+            .is_ignore()
+    });
     let refreshed_paths: BTreeSet<_> = refreshed_local
         .keys()
         .chain(refreshed_remote.keys())
@@ -523,6 +538,7 @@ mod tests {
             local_path: "/tmp".into(),
             remote_path: "/documents/".into(),
             enabled: true,
+            ignore_patterns: String::new(),
         };
         assert_eq!(
             remote_file(&mapping, "work/file.txt"),
@@ -538,6 +554,7 @@ mod tests {
             local_path: "/tmp/local".into(),
             remote_path: "documents".into(),
             enabled: true,
+            ignore_patterns: String::new(),
         };
         let mut changed = old.clone();
         changed.remote_path = "/documents/".into();

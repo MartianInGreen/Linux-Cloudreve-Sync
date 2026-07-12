@@ -11,6 +11,9 @@ base64 = "0.22"
 blake3 = "1.8"
 dirs = "6.0"
 eframe = "0.31"
+gtk = "0.18"
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 libsql = "0.9"
 percent-encoding = "2.3"
 quick-xml = { version = "0.37", features = ["serialize"] }
@@ -20,6 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.43", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+tray-icon = { version = "0.21", default-features = false }
 url = "2.5"
 uuid = { version = "1.12", features = ["v4", "serde"] }
 walkdir = "2.5"

@@ -9,6 +9,10 @@ Cloudreve WebDAV remote. The backend and GUI are both written in Rust.
 - Poll for local and remote changes and transfer them automatically.
 - Detect simultaneous local/remote edits and ask which copy to keep.
 - Show the current file operation, transfer counts, transferred size, and recent activity.
+- Continue syncing from a Linux system tray with show, sync-now, and quit actions.
+- Optionally start automatically through the XDG desktop autostart mechanism.
+- Apply gitignore-style patterns independently to each folder mapping.
+- Select multiple immediate subfolders from a top directory in one step.
 - Persist configuration and sync snapshots between launches.
 - Use Cloudreve's version-independent WebDAV interface.
 
@@ -24,10 +28,22 @@ Install the Rust toolchain and common Linux windowing development packages, then
 cargo run --release
 ```
 
+To build and install it for the current user under `~/.local`:
+
+```sh
+./install.sh
+```
+
+Set `PREFIX` to use another location, for example
+`PREFIX=/opt/cloudreve-sync sudo -E ./install.sh`.
+
+Arch Linux users can build the package with `makepkg -si`. Nix users can run or
+install it with `nix run .` or `nix profile install .`.
+
 On Debian/Ubuntu, eframe normally needs:
 
 ```sh
-sudo apt install build-essential pkg-config libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev
+sudo apt install build-essential pkg-config libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libgtk-3-dev libayatana-appindicator3-dev
 ```
 
 ## Setup
@@ -36,6 +52,23 @@ sudo apt install build-essential pkg-config libx11-dev libxi-dev libgl1-mesa-dev
 2. Enter the endpoint, Cloudreve username, and WebDAV password in the app.
 3. Add a local folder and enter its remote path, for example `Documents/work`.
 4. Save, then select **Sync now**.
+
+Use **Add some folders...** to select a top-level directory, choose its immediate
+subfolders from a checkbox list, and map all selected folders below one remote
+parent. Closing the main window hides it; use the tray menu to show it again or
+quit the process.
+
+Each mapping accepts one gitignore-style ignore pattern per line. Examples:
+
+```gitignore
+*.tmp
+.cache/
+**/target/
+```
+
+Ignored paths are excluded from both upload and download decisions. Enabling
+**Start automatically when I sign in** writes
+`~/.config/autostart/cloudreve-sync.desktop` when settings are saved.
 
 Configuration is stored in `~/.config/cloudreve-sync/config.json`. The password
 is currently stored in that file, so ensure your home directory is private.

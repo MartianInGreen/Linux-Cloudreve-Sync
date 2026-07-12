@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libsql::{params, Connection, Database};
 use std::{
     collections::BTreeMap,
@@ -37,10 +38,25 @@ impl LocalIndex {
         })
     }
 
-    pub async fn scan(&self, mapping_id: Uuid, root: &Path) -> Result<BTreeMap<String, String>> {
+    pub async fn scan(
+        &self,
+        mapping_id: Uuid,
+        root: &Path,
+        ignores: &Gitignore,
+    ) -> Result<BTreeMap<String, String>> {
         let mapping_id = mapping_id.to_string();
         let mut files = BTreeMap::new();
-        for entry in WalkDir::new(root).follow_links(false) {
+        let entries = WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                let relative = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                relative.as_os_str().is_empty()
+                    || !ignores
+                        .matched_path_or_any_parents(relative, entry.file_type().is_dir())
+                        .is_ignore()
+            });
+        for entry in entries {
             let entry = entry?;
             if !entry.file_type().is_file() {
                 continue;
@@ -114,6 +130,18 @@ impl LocalIndex {
     }
 }
 
+pub fn build_ignores(root: &Path, patterns: &str) -> Result<Gitignore> {
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in patterns
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        builder.add_line(None, pattern)?;
+    }
+    Ok(builder.build()?)
+}
+
 fn file_signature(metadata: &Metadata) -> Result<(i64, i64)> {
     let size = i64::try_from(metadata.len()).context("file is too large to index")?;
     let modified = metadata
@@ -140,7 +168,8 @@ mod tests {
             .unwrap();
         let mapping_id = Uuid::new_v4();
 
-        let files = index.scan(mapping_id, &root).await.unwrap();
+        let ignores = build_ignores(&root, "").unwrap();
+        let files = index.scan(mapping_id, &root, &ignores).await.unwrap();
         let expected = blake3::hash(b"cached content").to_hex().to_string();
         assert_eq!(files.get("note.txt"), Some(&expected));
 
@@ -150,5 +179,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cached, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn excludes_gitignore_style_patterns() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(directory.path().join("secret.tmp"), b"ignore").unwrap();
+        std::fs::create_dir(directory.path().join("cache")).unwrap();
+        std::fs::write(directory.path().join("cache/data.bin"), b"ignore").unwrap();
+        let index = LocalIndex::open(directory.path().join("index.db"))
+            .await
+            .unwrap();
+
+        let ignores = build_ignores(directory.path(), "*.tmp\ncache/\nindex.db*").unwrap();
+        let files = index
+            .scan(Uuid::new_v4(), directory.path(), &ignores)
+            .await
+            .unwrap();
+
+        assert!(files.contains_key("keep.txt"));
+        assert!(!files.contains_key("secret.tmp"));
+        assert!(!files.contains_key("cache/data.bin"));
     }
 }

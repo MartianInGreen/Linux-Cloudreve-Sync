@@ -9,6 +9,8 @@ pub struct AppConfig {
     pub password: String,
     pub poll_seconds: u64,
     pub mappings: Vec<SyncMapping>,
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 impl Default for AppConfig {
@@ -19,6 +21,7 @@ impl Default for AppConfig {
             password: String::new(),
             poll_seconds: 10,
             mappings: Vec::new(),
+            autostart: false,
         }
     }
 }
@@ -29,6 +32,8 @@ pub struct SyncMapping {
     pub local_path: PathBuf,
     pub remote_path: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub ignore_patterns: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

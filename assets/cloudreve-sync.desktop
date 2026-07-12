@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Cloudreve Sync
+Comment=Synchronize folders with Cloudreve
+Exec=cloudreve-sync
+Icon=cloudreve-sync
+Terminal=false
+Categories=Network;FileTransfer;
