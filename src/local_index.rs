@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use libsql::{params, Connection, Database};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
     collections::BTreeMap,
     fs::Metadata,
@@ -66,7 +68,8 @@ impl LocalIndex {
                 .strip_prefix(root)?
                 .to_string_lossy()
                 .replace('\\', "/");
-            let (size, modified_ns) = file_signature(&entry.metadata()?)?;
+            let before = entry.metadata()?;
+            let (size, modified_ns) = file_signature(&before)?;
             let hash = match self
                 .cached_hash(&mapping_id, &relative, size, modified_ns)
                 .await?
@@ -76,6 +79,13 @@ impl LocalIndex {
                     let hash = blake3::hash(&std::fs::read(entry.path())?)
                         .to_hex()
                         .to_string();
+                    let after = std::fs::metadata(entry.path())?;
+                    if file_signature(&after)? != (size, modified_ns) {
+                        anyhow::bail!(
+                            "{} changed while it was being indexed",
+                            entry.path().display()
+                        );
+                    }
                     self.store_hash(&mapping_id, &relative, size, modified_ns, &hash)
                         .await?;
                     hash
@@ -149,7 +159,17 @@ fn file_signature(metadata: &Metadata) -> Result<(i64, i64)> {
         .duration_since(UNIX_EPOCH)
         .context("file modification time is before 1970")?;
     let modified_ns = i64::try_from(modified.as_nanos()).context("file timestamp is too large")?;
-    Ok((size, modified_ns))
+    #[cfg(unix)]
+    let signature = modified_ns
+        ^ metadata
+            .ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(metadata.ctime_nsec())
+            .rotate_left(17)
+        ^ (metadata.ino() as i64).rotate_left(31);
+    #[cfg(not(unix))]
+    let signature = modified_ns;
+    Ok((size, signature))
 }
 
 #[cfg(test)]

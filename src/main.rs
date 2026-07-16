@@ -1,6 +1,7 @@
 mod autostart;
 mod local_index;
 mod model;
+mod power;
 mod storage;
 mod sync;
 mod webdav;
@@ -185,7 +186,7 @@ struct App {
     pending_remove: Option<Uuid>,
     collapsed_folder_groups: BTreeSet<PathBuf>,
     proxy: EventLoopProxy<AppUserEvent>,
-    _tray: ksni::blocking::Handle<CloudreveTray>,
+    tray: ksni::blocking::Handle<CloudreveTray>,
     // Window state — None when hidden to tray
     gl_window: Option<GlutinWindowContext>,
     gl: Option<Arc<glow::Context>>,
@@ -211,9 +212,9 @@ impl App {
         events: mpsc::UnboundedReceiver<BackendEvent>,
         proxy: EventLoopProxy<AppUserEvent>,
         tray: ksni::blocking::Handle<CloudreveTray>,
-    ) -> Self {
-        Self {
-            config: storage::load_config(),
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            config: storage::load_config()?,
             commands,
             events,
             status: "Ready".into(),
@@ -232,12 +233,12 @@ impl App {
             pending_remove: None,
             collapsed_folder_groups: BTreeSet::new(),
             proxy,
-            _tray: tray,
+            tray,
             gl_window: None,
             gl: None,
             egui_glow: None,
             repaint_delay: std::time::Duration::MAX,
-        }
+        })
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
@@ -1153,7 +1154,9 @@ impl winit::application::ApplicationHandler<AppUserEvent> for App {
                 + std::cmp::min(self.repaint_delay, std::time::Duration::from_millis(500));
             event_loop.set_control_flow(ControlFlow::WaitUntil(next));
         } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(500),
+            ));
         }
     }
 
@@ -1198,6 +1201,8 @@ impl winit::application::ApplicationHandler<AppUserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let _ = self.commands.send(BackendCommand::Shutdown);
+        self.tray.shutdown().wait();
         if let Some(mut eg) = self.egui_glow.take() {
             eg.destroy();
         }
@@ -1402,18 +1407,28 @@ fn pick_folder(title: &str) -> Option<PathBuf> {
 // ── Main ──
 
 fn main() -> anyhow::Result<()> {
+    let _instance_lock = storage::acquire_instance_lock()?;
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    let shutdown_tx = commands_tx.clone();
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     let runtime = tokio::runtime::Runtime::new()?;
-    std::thread::spawn(move || {
-        runtime.block_on(sync::run(commands_rx, events_tx));
-    });
+    let backend = std::thread::Builder::new()
+        .name("cloudreve-sync-backend".into())
+        .spawn(move || {
+            runtime.block_on(sync::run(commands_rx, events_tx));
+        })?;
 
     let event_loop = EventLoop::<AppUserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     let tray = create_tray(proxy.clone())?;
-    let mut app = App::new(commands_tx, events_rx, proxy, tray);
-    event_loop.run_app(&mut app)?;
+    let mut app = App::new(commands_tx, events_rx, proxy, tray)?;
+    let run_result = event_loop.run_app(&mut app);
+    let _ = shutdown_tx.send(BackendCommand::Shutdown);
+    drop(app);
+    backend
+        .join()
+        .map_err(|_| anyhow::anyhow!("sync backend thread panicked"))?;
+    run_result?;
     Ok(())
 }

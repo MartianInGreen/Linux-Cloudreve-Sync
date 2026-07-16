@@ -56,6 +56,8 @@ pub struct Conflict {
     pub local_exists: bool,
     pub remote_exists: bool,
     pub remote_path: Option<String>,
+    pub local_hash: Option<String>,
+    pub remote_tag: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -15,6 +15,8 @@ Cloudreve WebDAV remote. The backend and GUI are both written in Rust.
 - Select multiple immediate subfolders from a top directory in one step.
 - Persist configuration and sync snapshots between launches.
 - Use Cloudreve's version-independent WebDAV interface.
+- Pause active synchronization for system suspend and reconnect after resume.
+- Refuse unsafe bulk deletions when a mapped folder or storage backend disappears.
 
 This is an early release. Keep backups of important files. System tray
 integration, autostart, ignore patterns, and encrypted credential storage are
@@ -82,6 +84,14 @@ A change or deletion on only one side is applied
 to the other side automatically. If both copies changed since the snapshot, the
 app pauses that file and displays a conflict with **Keep local** and **Keep
 remote** actions.
+
+Mappings fail closed when the local folder is unavailable, the remote folder
+returns `404`, the server omits file ETags, or at least ten and at least 25% of
+the known files appear to have disappeared from one side. This prevents a
+temporarily unavailable mount or Cloudreve storage backend from being treated
+as an intentional bulk deletion. Configuration and state writes are atomic,
+and a malformed state file is reported instead of silently resetting sync
+history.
 
 If Cloudreve rejects a path during upload, the app encodes unsafe folder names
 with `.dissalowed-folder` and encodes the filename with `.dissalowed-type`. The
