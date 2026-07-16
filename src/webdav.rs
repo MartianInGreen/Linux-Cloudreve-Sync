@@ -170,13 +170,21 @@ impl WebDavClient {
     pub async fn download(&self, path: &str, expected_tag: Option<&str>) -> Result<Vec<u8>> {
         for attempt in 0..3 {
             let response = self
-                .send_read_with_retry(Method::GET, path, None, expected_tag)
+                .send_read_with_retry(Method::GET, path, None, None)
                 .await
                 .with_context(|| format!("requesting remote file {path}"))?
                 .error_for_status()
                 .with_context(|| format!("downloading remote file {path}"))?;
             match response.bytes().await {
-                Ok(body) => return Ok(body.to_vec()),
+                Ok(body) => {
+                    if let Some(expected_tag) = expected_tag {
+                        let current_tag = self.current_tag(path).await?;
+                        if current_tag != expected_tag {
+                            bail!("remote file {path} changed while it was downloading");
+                        }
+                    }
+                    return Ok(body.to_vec());
+                }
                 Err(_) if attempt < 2 => {
                     tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
                 }
@@ -187,6 +195,27 @@ impl WebDavClient {
             }
         }
         unreachable!()
+    }
+
+    async fn current_tag(&self, path: &str) -> Result<String> {
+        let response = self
+            .send_read_with_retry(Method::from_bytes(b"PROPFIND")?, path, Some("0"), None)
+            .await
+            .with_context(|| format!("checking remote file {path} after download"))?;
+        if response.status() != StatusCode::MULTI_STATUS && !response.status().is_success() {
+            bail!("checking remote file {path} returned {}", response.status());
+        }
+        let body = response.bytes().await?;
+        let expected = normalize_remote_path(path);
+        let entry = parse_multistatus(&body, &self.base)?
+            .into_iter()
+            .find(|(entry_path, _)| normalize_remote_path(entry_path) == expected)
+            .with_context(|| format!("WebDAV omitted {path} from its verification response"))?
+            .1;
+        if entry.tag.is_empty() {
+            bail!("WebDAV omitted the ETag for {path}");
+        }
+        Ok(entry.tag)
     }
 
     pub async fn upload(

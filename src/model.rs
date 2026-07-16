@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,6 +44,10 @@ pub struct SyncState {
     pub mappings: BTreeMap<Uuid, BTreeMap<String, EntryState>>,
     #[serde(default)]
     pub hash_algorithm: String,
+    #[serde(default)]
+    pub server_identity: String,
+    #[serde(default)]
+    pub remote_reseed_mappings: BTreeSet<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

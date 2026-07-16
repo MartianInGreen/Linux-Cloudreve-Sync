@@ -45,6 +45,14 @@ pub async fn run(
             return;
         }
     }
+    if refresh_server_identity(&config, &mut state) {
+        if let Err(error) = storage::save_state(&state) {
+            let _ = events.send(BackendEvent::Error(format!(
+                "Could not record the sync server identity: {error}"
+            )));
+            return;
+        }
+    }
     let index = match storage::data_path("local-index.db") {
         Ok(path) => match LocalIndex::open(path).await {
             Ok(index) => index,
@@ -175,7 +183,7 @@ pub async fn run(
                 match outcome {
                     ResolveOutcome::Finished(Ok(())) => {}
                     ResolveOutcome::Finished(Err(error)) => {
-                        let _ = events.send(BackendEvent::Error(error.to_string()));
+                        let _ = events.send(BackendEvent::Error(format!("{error:#}")));
                     }
                     ResolveOutcome::Interrupted(interruption) => handle_interruption(
                         interruption,
@@ -277,6 +285,33 @@ fn apply_config(
         )));
     }
     *config = next;
+    if refresh_server_identity(config, state) {
+        if let Err(error) = storage::save_state(state) {
+            let _ = events.send(BackendEvent::Error(format!(
+                "Could not update the sync server identity: {error}"
+            )));
+        }
+    }
+}
+
+fn refresh_server_identity(config: &AppConfig, state: &mut SyncState) -> bool {
+    let identity = format!(
+        "{}\n{}",
+        config.server_url.trim_end_matches('/'),
+        config.username
+    );
+    if state.server_identity == identity {
+        return false;
+    }
+    state.server_identity = identity;
+    state.remote_reseed_mappings.extend(
+        config
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.enabled)
+            .map(|mapping| mapping.id),
+    );
+    true
 }
 
 fn handle_interruption(
@@ -385,7 +420,7 @@ async fn sync_all(
         }
     };
     if let Err(error) = dav.test().await {
-        let _ = events.send(BackendEvent::Error(format!("Connection failed: {error}")));
+        let _ = events.send(BackendEvent::Error(format!("Connection failed: {error:#}")));
         let _ = events.send(BackendEvent::SyncFinished(false));
         return;
     }
@@ -398,7 +433,7 @@ async fn sync_all(
         if let Err(error) = sync_mapping(&dav, mapping, state, index, events).await {
             succeeded = false;
             let _ = events.send(BackendEvent::Error(format!(
-                "{}: {error}",
+                "{}: {error:#}",
                 mapping.local_path.display()
             )));
         }
@@ -436,6 +471,8 @@ async fn sync_mapping(
     )));
     let ignores = build_ignores(&mapping.local_path, &mapping.ignore_patterns)?;
     let local = index.scan(mapping.id, &local_root, &ignores).await?;
+    let reseed_allowed = state.remote_reseed_mappings.contains(&mapping.id);
+    let previous = state.mappings.entry(mapping.id).or_default();
     let _ = events.send(BackendEvent::Status(format!(
         "Reading Cloudreve folder /{}...",
         mapping.remote_path.trim_matches('/')
@@ -443,6 +480,42 @@ async fn sync_mapping(
     let listed = dav.list_recursive(remote_root).await?;
     let mut remote = match listed {
         CollectionListing::Found(entries) => canonical_remote_entries(entries)?,
+        CollectionListing::Missing
+            if reseed_allowed || can_seed_missing_remote(previous, &local) =>
+        {
+            let _ = events.send(BackendEvent::Status(format!(
+                "Creating Cloudreve folder /{remote_root} from local files..."
+            )));
+            for path in local.keys() {
+                upload(dav, mapping, &local_root, path, None, events).await?;
+            }
+            let mut seeded_remote = match dav.list_recursive(remote_root).await? {
+                CollectionListing::Found(entries) => canonical_remote_entries(entries)?,
+                CollectionListing::Missing => {
+                    anyhow::bail!("remote folder /{remote_root} is still unavailable after upload")
+                }
+            };
+            seeded_remote.retain(|path, entry| {
+                !ignores
+                    .matched_path_or_any_parents(path, entry.is_dir)
+                    .is_ignore()
+            });
+            previous.clear();
+            for (path, hash) in &local {
+                let entry = seeded_remote.get(path).with_context(|| {
+                    format!("uploaded file /{remote_root}/{path} is missing from Cloudreve")
+                })?;
+                previous.insert(
+                    path.clone(),
+                    EntryState {
+                        local_hash: Some(hash.clone()),
+                        remote_tag: Some(entry.tag.clone()),
+                    },
+                );
+            }
+            state.remote_reseed_mappings.remove(&mapping.id);
+            return Ok(());
+        }
         CollectionListing::Missing => {
             anyhow::bail!(
                 "mapped remote folder /{remote_root} is unavailable; refusing to treat it as empty"
@@ -454,7 +527,6 @@ async fn sync_mapping(
             .matched_path_or_any_parents(path, entry.is_dir)
             .is_ignore()
     });
-    let previous = state.mappings.entry(mapping.id).or_default();
     guard_bulk_deletions(previous, &local, &remote)?;
     let mut conflicted = BTreeSet::new();
     let paths: BTreeSet<_> = local.keys().chain(remote.keys()).cloned().collect();
@@ -584,6 +656,7 @@ async fn sync_mapping(
             },
         );
     }
+    state.remote_reseed_mappings.remove(&mapping.id);
     Ok(())
 }
 
@@ -1056,6 +1129,13 @@ fn guard_bulk_deletions(
     Ok(())
 }
 
+fn can_seed_missing_remote(
+    previous: &BTreeMap<String, EntryState>,
+    local: &BTreeMap<String, String>,
+) -> bool {
+    previous.is_empty() && !local.is_empty()
+}
+
 fn mapping_paths_changed(old: &SyncMapping, new: &SyncMapping) -> bool {
     old.local_path != new.local_path
         || old.remote_path.trim_matches('/') != new.remote_path.trim_matches('/')
@@ -1233,6 +1313,57 @@ mod tests {
             .collect();
 
         assert!(guard_bulk_deletions(&previous, &local, &remote).is_err());
+    }
+
+    #[test]
+    fn only_new_nonempty_mappings_can_seed_a_missing_remote_root() {
+        let local = BTreeMap::from([("file.txt".into(), "hash".into())]);
+        let previous = BTreeMap::new();
+        assert!(can_seed_missing_remote(&previous, &local));
+
+        let previous = BTreeMap::from([(
+            "file.txt".into(),
+            EntryState {
+                local_hash: Some("hash".into()),
+                remote_tag: Some("tag".into()),
+            },
+        )]);
+        assert!(!can_seed_missing_remote(&previous, &local));
+        assert!(!can_seed_missing_remote(&BTreeMap::new(), &BTreeMap::new()));
+    }
+
+    #[test]
+    fn changing_servers_marks_mappings_for_reseed_without_clearing_snapshots() {
+        let mapping_id = Uuid::new_v4();
+        let config = AppConfig {
+            server_url: "https://new.example/dav".into(),
+            username: "user".into(),
+            mappings: vec![SyncMapping {
+                id: mapping_id,
+                local_path: "/tmp/files".into(),
+                remote_path: "files".into(),
+                enabled: true,
+                ignore_patterns: String::new(),
+            }],
+            ..AppConfig::default()
+        };
+        let entries = BTreeMap::from([(
+            "file.txt".into(),
+            EntryState {
+                local_hash: Some("hash".into()),
+                remote_tag: Some("tag".into()),
+            },
+        )]);
+        let mut state = SyncState {
+            mappings: BTreeMap::from([(mapping_id, entries.clone())]),
+            server_identity: "https://old.example/dav\nuser".into(),
+            ..SyncState::default()
+        };
+
+        assert!(refresh_server_identity(&config, &mut state));
+        assert_eq!(state.mappings[&mapping_id], entries);
+        assert!(state.remote_reseed_mappings.contains(&mapping_id));
+        assert!(!refresh_server_identity(&config, &mut state));
     }
 
     #[tokio::test]
