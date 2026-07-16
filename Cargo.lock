@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "cloudreve-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4522,7 +4522,7 @@ dependencies = [
 name = "windows-interface"
 version = "0.58.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "053c4c462dc91d3b1504c6fe5a726dd15e216ba718e84a0e46a88fbe5ded3515"
+checksum = "053c4c462dc91d3b1504c6fe5a726dd15e216ca718e84a0e46a88fbe5ded3515"
 dependencies = [
  "proc-macro2",
  "quote",
